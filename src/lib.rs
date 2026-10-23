@@ -4,6 +4,7 @@ mod config;
 mod contact;
 mod error;
 pub mod id;
+mod lookup;
 mod node;
 pub mod protocol;
 pub mod routing;

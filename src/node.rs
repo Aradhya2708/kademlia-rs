@@ -3,6 +3,7 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::net::ToSocketAddrs;
 use tokio::task::JoinHandle;
@@ -11,6 +12,7 @@ use crate::config::Config;
 use crate::contact::Contact;
 use crate::error::{Error, Result};
 use crate::id::NodeId;
+use crate::lookup;
 use crate::protocol::{Body, MAX_DATAGRAM_LEN, Message, Request, Response};
 use crate::routing::{RoutingTable, UpdateOutcome};
 use crate::transport::{Reply, Transport};
@@ -95,7 +97,18 @@ impl Node {
     pub async fn bootstrap(&self, seed: SocketAddr) -> Result<()> {
         // The receive loop adds the seed to our table when its pong arrives.
         self.ping(seed).await?;
+
+        // Looking ourselves up fills in the buckets near our own id, and
+        // tells the nodes there that we exist. Then refresh everything
+        // further out so the rest of the table isn't empty.
+        lookup::find_node(&self.inner, self.id()).await;
+        self.inner.refresh_buckets(Duration::ZERO).await;
         Ok(())
+    }
+
+    /// Finds the `k` nodes closest to `target` in the network.
+    pub async fn find_node(&self, target: NodeId) -> Vec<Contact> {
+        lookup::find_node(&self.inner, target).await
     }
 
     /// Stops the node. Same as dropping it, but easier to spot in code.
@@ -173,16 +186,47 @@ impl Inner {
 
         let inner = Arc::clone(self);
         tokio::spawn(async move {
-            let alive = matches!(
-                inner.transport.request(contact.addr, Request::Ping).await,
-                Ok(reply) if reply.sender == contact.id
-            );
-            if !alive {
+            if inner.rpc(&contact, Request::Ping).await.is_err() {
                 tracing::debug!(peer = ?contact.id, "evicting unresponsive contact");
                 inner.table.lock().unwrap().remove(&contact.id);
             }
             inner.liveness_checks.lock().unwrap().remove(&contact.id);
         });
+    }
+
+    /// Sends a request to a contact we already know, and checks that the
+    /// answer really came from it.
+    ///
+    /// Contacts that don't answer are reported to the routing table, which
+    /// may evict them.
+    pub(crate) async fn rpc(&self, contact: &Contact, request: Request) -> Result<Response> {
+        match self.transport.request(contact.addr, request).await {
+            Ok(reply) if reply.sender == contact.id => Ok(reply.response),
+            Ok(reply) => {
+                // A different node lives at that address now.
+                tracing::debug!(
+                    expected = ?contact.id,
+                    actual = ?reply.sender,
+                    "node at {} changed id",
+                    contact.addr
+                );
+                self.table.lock().unwrap().remove(&contact.id);
+                Err(Error::UnexpectedResponse)
+            }
+            Err(e) => {
+                self.table.lock().unwrap().mark_unresponsive(&contact.id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Runs a lookup for a random id in every bucket that hasn't seen one in
+    /// `max_age`.
+    pub(crate) async fn refresh_buckets(self: &Arc<Self>, max_age: Duration) {
+        let stale = self.table.lock().unwrap().stale_buckets(max_age);
+        for index in stale {
+            lookup::find_node(self, self.id.random_in_bucket(index)).await;
+        }
     }
 
     /// Our `k` closest contacts to `target`, minus whoever asked. They
@@ -222,7 +266,6 @@ async fn receive_loop(inner: Arc<Inner>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn test_config() -> Config {
         Config {
