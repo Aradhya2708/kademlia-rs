@@ -10,3 +10,6 @@ keywords = ["kademlia", "dht", "p2p", "networking"]
 categories = ["network-programming"]
 
 [dependencies]
+rand = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+sha1 = "0.11.0"
