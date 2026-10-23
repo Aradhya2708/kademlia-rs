@@ -52,6 +52,28 @@ impl NodeId {
         }
         Distance(out)
     }
+
+    /// Returns a random id that falls in bucket `index` relative to `self`.
+    ///
+    /// Refreshing a bucket comes down to looking up some id in its range, and
+    /// this is how we pick one.
+    pub fn random_in_bucket(&self, index: usize) -> NodeId {
+        assert!(index < ID_BITS, "bucket index {index} out of range");
+
+        // Build a random distance whose highest set bit is `index`: clear
+        // everything above it, set it, and leave the lower bits random.
+        let mut distance: [u8; ID_LEN] = rand::random();
+        let byte = ID_LEN - 1 - index / 8;
+        let bit = index % 8;
+        distance[..byte].fill(0);
+        distance[byte] = (distance[byte] & ((1 << bit) - 1)) | (1 << bit);
+
+        let mut out = self.0;
+        for (o, d) in out.iter_mut().zip(&distance) {
+            *o ^= d;
+        }
+        NodeId(out)
+    }
 }
 
 impl fmt::Display for NodeId {
@@ -93,6 +115,16 @@ impl Distance {
             zeros += 8;
         }
         zeros
+    }
+
+    /// Index of the k-bucket that a node at this distance belongs in.
+    ///
+    /// Bucket `i` covers distances in `[2^i, 2^(i+1))`, so the index is the
+    /// position of the highest set bit. A zero distance means the id is our
+    /// own, and we never put ourselves in a bucket.
+    pub fn bucket_index(&self) -> Option<usize> {
+        let zeros = self.leading_zeros() as usize;
+        (zeros < ID_BITS).then(|| ID_BITS - 1 - zeros)
     }
 }
 
@@ -171,6 +203,32 @@ mod tests {
             origin.distance(&id_with_last_byte(0b1000)).leading_zeros(),
             156
         );
+    }
+
+    #[test]
+    fn bucket_index_is_position_of_highest_bit() {
+        let origin = NodeId::from_bytes([0; ID_LEN]);
+        assert_eq!(Distance::ZERO.bucket_index(), None);
+        assert_eq!(Distance::MAX.bucket_index(), Some(159));
+        assert_eq!(
+            origin.distance(&id_with_last_byte(1)).bucket_index(),
+            Some(0)
+        );
+        assert_eq!(
+            origin.distance(&id_with_last_byte(0b101)).bucket_index(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn random_in_bucket_lands_in_that_bucket() {
+        let id = NodeId::random();
+        for index in 0..ID_BITS {
+            for _ in 0..5 {
+                let other = id.random_in_bucket(index);
+                assert_eq!(id.distance(&other).bucket_index(), Some(index));
+            }
+        }
     }
 
     #[test]
