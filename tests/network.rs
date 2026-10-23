@@ -66,6 +66,29 @@ async fn lookup_finds_the_true_closest_nodes() {
 }
 
 #[tokio::test]
+async fn lookup_routes_around_dead_nodes() {
+    let mut nodes = network(30, config()).await;
+    let searcher = nodes.remove(0);
+    let target = NodeId::random();
+
+    // Take down the k nodes closest to the target. Every routing table in
+    // the network still has them.
+    nodes.sort_by_key(|n| n.id().distance(&target));
+    let survivors = nodes.split_off(K);
+    drop(nodes);
+
+    // We can't expect the exact k closest survivors here: every peer's
+    // answer is still full of the dead nodes, so some survivors may not be
+    // mentioned by anyone until tables heal. But the lookup must not give up,
+    // and everything it returns must be alive.
+    let found = searcher.find_node(target).await;
+    assert_eq!(found.len(), K);
+    for contact in &found {
+        assert!(survivors.iter().any(|n| n.id() == contact.id));
+    }
+}
+
+#[tokio::test]
 async fn value_put_on_one_node_can_be_read_from_any_other() {
     let nodes = network(30, config()).await;
     nodes[7].put(b"answer", b"42".to_vec()).await.unwrap();

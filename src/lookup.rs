@@ -80,10 +80,14 @@ async fn run(inner: &Arc<Inner>, target: NodeId, kind: Kind) -> Outcome {
     // target. That makes the distance a fine key, and keeps the map sorted
     // nearest first for free.
     let mut shortlist: BTreeMap<Distance, Candidate> = BTreeMap::new();
+    // Seed with every contact we have, not just the k closest. Only the k
+    // closest live ones get asked anyway, but if those turn out to be dead
+    // the next ones in line are already waiting, instead of the lookup
+    // running out of people to ask and giving up.
     let seeds = {
         let mut table = inner.table.lock().unwrap();
         table.mark_looked_up(&target);
-        table.closest(&target, k)
+        table.closest(&target, usize::MAX)
     };
     for contact in seeds {
         shortlist.insert(
