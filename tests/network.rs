@@ -1,8 +1,10 @@
 //! End-to-end tests that run whole networks of nodes on localhost.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use kademlia::{Config, Node, NodeId};
+use tokio::task::JoinSet;
 
 const K: usize = 8;
 
@@ -173,4 +175,57 @@ async fn lone_node_still_stores_values() {
     let node = Node::bind("127.0.0.1:0", config()).await.unwrap();
     assert_eq!(node.put(b"k", b"v".to_vec()).await.unwrap(), 1);
     assert_eq!(node.get(b"k").await.as_deref(), Some(&b"v"[..]));
+}
+
+#[tokio::test]
+async fn late_joiners_can_read_older_values() {
+    let mut nodes = network(15, config()).await;
+    nodes[4]
+        .put(b"old news", b"still relevant".to_vec())
+        .await
+        .unwrap();
+
+    // Join through a node other than the original seed, for variety.
+    let entry = nodes[9].local_addr();
+    for _ in 0..15 {
+        let node = Node::bind("127.0.0.1:0", config()).await.unwrap();
+        node.bootstrap(entry).await.unwrap();
+        nodes.push(node);
+    }
+
+    for node in &nodes[15..] {
+        assert_eq!(
+            node.get(b"old news").await.as_deref(),
+            Some(&b"still relevant"[..])
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writers_do_not_step_on_each_other() {
+    let nodes: Vec<_> = network(25, config())
+        .await
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+
+    let mut writers = JoinSet::new();
+    for (i, node) in nodes.iter().enumerate() {
+        let node = Arc::clone(node);
+        writers.spawn(async move {
+            let key = format!("key-{i}");
+            node.put(key.as_bytes(), i.to_string().into_bytes())
+                .await
+                .unwrap();
+        });
+    }
+    writers.join_all().await;
+
+    for (i, node) in nodes.iter().rev().enumerate() {
+        let key = format!("key-{i}");
+        assert_eq!(
+            node.get(key.as_bytes()).await,
+            Some(i.to_string().into_bytes())
+        );
+    }
 }
