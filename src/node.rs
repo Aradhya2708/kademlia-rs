@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::net::ToSocketAddrs;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::config::Config;
 use crate::contact::Contact;
@@ -117,6 +117,47 @@ impl Node {
     /// Finds the `k` nodes closest to `target` in the network.
     pub async fn find_node(&self, target: NodeId) -> Vec<Contact> {
         lookup::find_node(&self.inner, target).await
+    }
+
+    /// Stores `value` under `key` on the `k` nodes closest to the key.
+    ///
+    /// The key is hashed into the keyspace with SHA-1, so any bytes will do.
+    /// Returns how many nodes ended up holding the value, counting this one:
+    /// the publisher always keeps a copy, so a lone node still works, and the
+    /// value sticks around for as long as we do.
+    pub async fn put(&self, key: &[u8], value: Vec<u8>) -> Result<usize> {
+        if value.len() > MAX_VALUE_LEN {
+            return Err(Error::ValueTooLarge(value.len()));
+        }
+        let key = NodeId::hash(key);
+        let ttl = self.inner.config.record_ttl;
+
+        let kept = self
+            .inner
+            .store
+            .lock()
+            .unwrap()
+            .put(key, value.clone(), ttl, Instant::now());
+        let replicas = self.inner.replicate(key, value, ttl).await;
+        Ok(usize::from(kept) + replicas)
+    }
+
+    /// Fetches the value stored under `key`, if anyone in the network has it.
+    pub async fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let key = NodeId::hash(key);
+        let local = self
+            .inner
+            .store
+            .lock()
+            .unwrap()
+            .get(&key, Instant::now())
+            .map(|r| r.value.clone());
+        if local.is_some() {
+            return local;
+        }
+        lookup::find_value(&self.inner, key)
+            .await
+            .map(|found| found.value)
     }
 
     /// Stops the node. Same as dropping it, but easier to spot in code.
@@ -249,6 +290,33 @@ impl Inner {
                 Err(e)
             }
         }
+    }
+
+    /// Sends a STORE to the `k` closest nodes we can find for `key`, and
+    /// returns how many of them accepted it.
+    pub(crate) async fn replicate(
+        self: &Arc<Self>,
+        key: NodeId,
+        value: Vec<u8>,
+        ttl: Duration,
+    ) -> usize {
+        let targets = lookup::find_node(self, key).await;
+        let mut stores = JoinSet::new();
+        for contact in targets {
+            let inner = Arc::clone(self);
+            let request = Request::Store {
+                key,
+                value: value.clone(),
+                ttl,
+            };
+            stores.spawn(async move { inner.rpc(&contact, request).await });
+        }
+        stores
+            .join_all()
+            .await
+            .into_iter()
+            .filter(|result| matches!(result, Ok(Response::Stored)))
+            .count()
     }
 
     /// Runs a lookup for a random id in every bucket that hasn't seen one in

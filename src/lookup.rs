@@ -3,7 +3,8 @@
 //! A lookup starts from the closest contacts in our own table and keeps asking
 //! the closest nodes it has heard of for nodes even closer to the target, with
 //! up to `alpha` requests in flight at once. It finishes when the `k` closest
-//! nodes it knows about have all answered.
+//! nodes it knows about have all answered, or, for a value lookup, as soon as
+//! someone hands over the value.
 //!
 //! The paper phrases termination in terms of rounds: once a round turns up
 //! nobody closer, query the remaining unqueried nodes among the `k` closest.
@@ -19,6 +20,22 @@ use crate::contact::Contact;
 use crate::id::{Distance, NodeId};
 use crate::node::Inner;
 use crate::protocol::{Request, Response};
+
+/// A value lookup that found something.
+pub(crate) struct FoundValue {
+    pub value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Node,
+    Value,
+}
+
+enum Outcome {
+    Nodes(Vec<Contact>),
+    Value(FoundValue),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -36,6 +53,21 @@ struct Candidate {
 /// Finds the `k` nodes closest to `target` that are reachable right now,
 /// nearest first.
 pub(crate) async fn find_node(inner: &Arc<Inner>, target: NodeId) -> Vec<Contact> {
+    match run(inner, target, Kind::Node).await {
+        Outcome::Nodes(nodes) => nodes,
+        Outcome::Value(_) => unreachable!("node lookups never accept a value"),
+    }
+}
+
+/// Looks for the value stored under `key`.
+pub(crate) async fn find_value(inner: &Arc<Inner>, key: NodeId) -> Option<FoundValue> {
+    match run(inner, key, Kind::Value).await {
+        Outcome::Value(found) => Some(found),
+        Outcome::Nodes(_) => None,
+    }
+}
+
+async fn run(inner: &Arc<Inner>, target: NodeId, kind: Kind) -> Outcome {
     let k = inner.config.k;
 
     // XOR is a bijection, so every id is at a different distance from the
@@ -73,10 +105,14 @@ pub(crate) async fn find_node(inner: &Arc<Inner>, target: NodeId) -> Vec<Contact
             };
             next.state = State::InFlight;
 
+            let request = match kind {
+                Kind::Node => Request::FindNode { target },
+                Kind::Value => Request::FindValue { key: target },
+            };
             let inner = Arc::clone(inner);
             let contact = next.contact;
             in_flight.spawn(async move {
-                let result = inner.rpc(&contact, Request::FindNode { target }).await;
+                let result = inner.rpc(&contact, request).await;
                 (contact, result)
             });
         }
@@ -107,14 +143,20 @@ pub(crate) async fn find_node(inner: &Arc<Inner>, target: NodeId) -> Vec<Contact
                         });
                 }
             }
+            Ok(Response::Value { value, .. }) if kind == Kind::Value => {
+                // Returning drops `in_flight`, which cancels whatever is
+                // still outstanding.
+                return Outcome::Value(FoundValue { value });
+            }
             Ok(_) | Err(_) => candidate.state = State::Failed,
         }
     }
 
-    shortlist
+    let nodes = shortlist
         .into_values()
         .filter(|c| c.state == State::Answered)
         .take(k)
         .map(|c| c.contact)
-        .collect()
+        .collect();
+    Outcome::Nodes(nodes)
 }

@@ -16,6 +16,9 @@ pub enum Error {
 
     #[error("peer sent a response that doesn't match the request")]
     UnexpectedResponse,
+
+    #[error("value is {0} bytes, more than the {max} byte limit", max = crate::protocol::MAX_VALUE_LEN)]
+    ValueTooLarge(usize),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
