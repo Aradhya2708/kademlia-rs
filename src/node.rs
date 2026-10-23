@@ -155,9 +155,24 @@ impl Node {
         if local.is_some() {
             return local;
         }
-        lookup::find_value(&self.inner, key)
-            .await
-            .map(|found| found.value)
+
+        let found = lookup::find_value(&self.inner, key).await?;
+        // Cache a copy at the closest node that didn't have it, as in section
+        // 2.3 of the paper. Lookups for popular keys then find the value
+        // before they get all the way to the k closest nodes. Nobody needs to
+        // wait for this, so it runs in the background.
+        if let Some(contact) = found.cache_at {
+            let inner = Arc::clone(&self.inner);
+            let request = Request::Store {
+                key,
+                value: found.value.clone(),
+                ttl: found.ttl,
+            };
+            tokio::spawn(async move {
+                let _ = inner.rpc(&contact, request).await;
+            });
+        }
+        Some(found.value)
     }
 
     /// Stops the node. Same as dropping it, but easier to spot in code.
@@ -551,5 +566,30 @@ mod tests {
             a.inner.rpc(&b_contact, store(b"two")).await.unwrap(),
             Response::Rejected
         );
+    }
+
+    #[tokio::test]
+    async fn get_caches_the_value_on_the_way() {
+        let a = local_node().await;
+        let b = local_node().await;
+        let c = local_node().await;
+
+        // A chain: a only knows b, and b knows c. Only c has the value.
+        a.ping(b.local_addr()).await.unwrap();
+        b.ping(c.local_addr()).await.unwrap();
+        let key = NodeId::hash(b"popular");
+        c.inner.store.lock().unwrap().put(
+            key,
+            b"value".to_vec(),
+            Duration::from_secs(60),
+            Instant::now(),
+        );
+
+        assert_eq!(a.get(b"popular").await.as_deref(), Some(&b"value"[..]));
+
+        // b answered without the value, so it should get the cached copy.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(b.record_count(), 1);
+        assert_eq!(a.record_count(), 0);
     }
 }

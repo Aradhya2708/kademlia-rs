@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::task::JoinSet;
 
@@ -24,6 +25,11 @@ use crate::protocol::{Request, Response};
 /// A value lookup that found something.
 pub(crate) struct FoundValue {
     pub value: Vec<u8>,
+    /// How much longer the record has to live.
+    pub ttl: Duration,
+    /// The closest node that answered the lookup without having the value.
+    /// That's where the caller should cache a copy.
+    pub cache_at: Option<Contact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,10 +149,18 @@ async fn run(inner: &Arc<Inner>, target: NodeId, kind: Kind) -> Outcome {
                         });
                 }
             }
-            Ok(Response::Value { value, .. }) if kind == Kind::Value => {
+            Ok(Response::Value { value, ttl }) if kind == Kind::Value => {
+                let cache_at = shortlist
+                    .values()
+                    .find(|c| c.state == State::Answered)
+                    .map(|c| c.contact);
                 // Returning drops `in_flight`, which cancels whatever is
                 // still outstanding.
-                return Outcome::Value(FoundValue { value });
+                return Outcome::Value(FoundValue {
+                    value,
+                    ttl,
+                    cache_at,
+                });
             }
             Ok(_) | Err(_) => candidate.state = State::Failed,
         }
