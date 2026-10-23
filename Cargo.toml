@@ -1,0 +1,12 @@
+[package]
+name = "kademlia"
+version = "0.1.0"
+edition = "2024"
+description = "A Kademlia distributed hash table over UDP, built on tokio"
+license = "MIT"
+repository = "https://github.com/Aradhya2708/kademlia-rs"
+readme = "README.md"
+keywords = ["kademlia", "dht", "p2p", "networking"]
+categories = ["network-programming"]
+
+[dependencies]
