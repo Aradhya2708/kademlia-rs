@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -11,7 +12,7 @@ use crate::contact::Contact;
 use crate::error::{Error, Result};
 use crate::id::NodeId;
 use crate::protocol::{Body, MAX_DATAGRAM_LEN, Message, Request, Response};
-use crate::routing::RoutingTable;
+use crate::routing::{RoutingTable, UpdateOutcome};
 use crate::transport::{Reply, Transport};
 
 /// A running Kademlia node.
@@ -30,6 +31,8 @@ pub(crate) struct Inner {
     pub config: Config,
     pub transport: Transport,
     pub table: Mutex<RoutingTable>,
+    /// Contacts we're currently pinging to decide whether to evict them.
+    liveness_checks: Mutex<HashSet<NodeId>>,
 }
 
 impl Node {
@@ -50,6 +53,7 @@ impl Node {
             table: Mutex::new(RoutingTable::new(id, config.k)),
             transport,
             config,
+            liveness_checks: Mutex::new(HashSet::new()),
         });
 
         let receiver = tokio::spawn(receive_loop(Arc::clone(&inner)));
@@ -148,8 +152,37 @@ impl Inner {
         }
     }
 
-    fn observe(&self, contact: Contact) {
-        self.table.lock().unwrap().update(contact);
+    fn observe(self: &Arc<Self>, contact: Contact) {
+        let outcome = self.table.lock().unwrap().update(contact);
+        if let UpdateOutcome::Full { least_recent } = outcome {
+            self.check_liveness(least_recent);
+        }
+    }
+
+    /// Pings a contact that's in line to be evicted from a full bucket.
+    ///
+    /// If it answers, the receive loop moves it to the back of its bucket and
+    /// the newcomer stays in the replacement cache. If it doesn't, we drop it
+    /// and the newest replacement takes its slot.
+    fn check_liveness(self: &Arc<Self>, contact: Contact) {
+        // A busy bucket can ask about the same contact many times over while
+        // the first ping is still out. One is enough.
+        if !self.liveness_checks.lock().unwrap().insert(contact.id) {
+            return;
+        }
+
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            let alive = matches!(
+                inner.transport.request(contact.addr, Request::Ping).await,
+                Ok(reply) if reply.sender == contact.id
+            );
+            if !alive {
+                tracing::debug!(peer = ?contact.id, "evicting unresponsive contact");
+                inner.table.lock().unwrap().remove(&contact.id);
+            }
+            inner.liveness_checks.lock().unwrap().remove(&contact.id);
+        });
     }
 
     /// Our `k` closest contacts to `target`, minus whoever asked. They
@@ -241,5 +274,47 @@ mod tests {
         // Still alive and answering.
         let b = local_node().await;
         assert_eq!(b.ping(a.local_addr()).await.unwrap(), a.id());
+    }
+
+    /// Three nodes where `b` and `c` share a bucket in `a`'s table, and that
+    /// bucket only has room for one of them.
+    async fn crowded_bucket() -> (Node, Node, Node) {
+        let id = |first: u8, last: u8| {
+            let mut bytes = [0u8; crate::id::ID_LEN];
+            bytes[0] = first;
+            bytes[crate::id::ID_LEN - 1] = last;
+            NodeId::from_bytes(bytes)
+        };
+        let config = Config {
+            k: 1,
+            ..test_config()
+        };
+        let a = Node::bind_with_id(id(0, 0), "127.0.0.1:0", config.clone());
+        let b = Node::bind_with_id(id(0x80, 1), "127.0.0.1:0", config.clone());
+        let c = Node::bind_with_id(id(0x80, 2), "127.0.0.1:0", config);
+        (a.await.unwrap(), b.await.unwrap(), c.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn full_bucket_keeps_a_live_contact() {
+        let (a, b, c) = crowded_bucket().await;
+        b.ping(a.local_addr()).await.unwrap();
+        c.ping(a.local_addr()).await.unwrap();
+
+        // a pings b to check on it, b answers, and c stays out.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(a.peers(), vec![Contact::new(b.id(), b.local_addr())]);
+    }
+
+    #[tokio::test]
+    async fn full_bucket_replaces_a_dead_contact() {
+        let (a, b, c) = crowded_bucket().await;
+        b.ping(a.local_addr()).await.unwrap();
+        b.shutdown();
+        c.ping(a.local_addr()).await.unwrap();
+
+        // a's ping to b times out, so c gets promoted from the replacement cache.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(a.peers(), vec![Contact::new(c.id(), c.local_addr())]);
     }
 }
