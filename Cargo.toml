@@ -10,6 +10,8 @@ keywords = ["kademlia", "dht", "p2p", "networking"]
 categories = ["network-programming"]
 
 [dependencies]
+postcard = { version = "1.1.3", features = ["use-std"] }
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 sha1 = "0.11.0"
+thiserror = "2.0.21"
