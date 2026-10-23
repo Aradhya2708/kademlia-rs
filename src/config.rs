@@ -14,16 +14,25 @@ pub struct Config {
     pub record_ttl: Duration,
     /// The most records a node will hold for other people.
     pub max_records: usize,
+    /// How often a node pushes the records it holds back out to the `k`
+    /// closest nodes. This keeps values alive as nodes come and go. Expired
+    /// records are swept out on the same schedule.
+    pub republish_interval: Duration,
+    /// Buckets that go this long without a lookup get refreshed with one.
+    pub refresh_interval: Duration,
 }
 
 impl Default for Config {
     fn default() -> Self {
+        const HOUR: Duration = Duration::from_secs(60 * 60);
         Self {
             k: 20,
             alpha: 3,
             request_timeout: Duration::from_secs(2),
-            record_ttl: Duration::from_secs(24 * 60 * 60),
+            record_ttl: 24 * HOUR,
             max_records: 65_536,
+            republish_interval: HOUR,
+            refresh_interval: HOUR,
         }
     }
 }

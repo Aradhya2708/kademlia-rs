@@ -125,6 +125,50 @@ async fn oversized_values_are_refused() {
 }
 
 #[tokio::test]
+async fn records_expire_everywhere() {
+    let config = Config {
+        record_ttl: Duration::from_millis(300),
+        republish_interval: Duration::from_millis(200),
+        ..config()
+    };
+    let nodes = network(5, config).await;
+    nodes[1].put(b"short lived", vec![1, 2, 3]).await.unwrap();
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(nodes[2].get(b"short lived").await, None);
+    assert_eq!(nodes.iter().map(Node::record_count).sum::<usize>(), 0);
+}
+
+#[tokio::test]
+async fn republishing_keeps_values_alive_when_holders_leave() {
+    let config = Config {
+        republish_interval: Duration::from_millis(500),
+        ..config()
+    };
+    let mut nodes = network(30, config).await;
+    let publisher = nodes.remove(0);
+    publisher
+        .put(b"durable", b"still here".to_vec())
+        .await
+        .unwrap();
+
+    // Take down every node that got a copy, so only the publisher has it.
+    nodes.retain(|node| node.record_count() == 0);
+
+    // Give the publisher time to push the value out to the nodes that are
+    // now closest, then take it down too.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    publisher.shutdown();
+
+    for node in nodes.iter().step_by(5) {
+        assert_eq!(
+            node.get(b"durable").await.as_deref(),
+            Some(&b"still here"[..])
+        );
+    }
+}
+
+#[tokio::test]
 async fn lone_node_still_stores_values() {
     let node = Node::bind("127.0.0.1:0", config()).await.unwrap();
     assert_eq!(node.put(b"k", b"v".to_vec()).await.unwrap(), 1);

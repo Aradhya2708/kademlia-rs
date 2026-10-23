@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use tokio::net::ToSocketAddrs;
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{self, MissedTickBehavior};
 
 use crate::config::Config;
 use crate::contact::Contact;
@@ -61,11 +62,18 @@ impl Node {
             liveness_checks: Mutex::new(HashSet::new()),
         });
 
-        let receiver = tokio::spawn(receive_loop(Arc::clone(&inner)));
-        Ok(Self {
-            inner,
-            tasks: vec![receiver],
-        })
+        let tasks = vec![
+            tokio::spawn(receive_loop(Arc::clone(&inner))),
+            spawn_periodic(&inner, inner.config.refresh_interval, |inner| async move {
+                inner.refresh_buckets(inner.config.refresh_interval).await
+            }),
+            spawn_periodic(
+                &inner,
+                inner.config.republish_interval,
+                |inner| async move { inner.republish().await },
+            ),
+        ];
+        Ok(Self { inner, tasks })
     }
 
     pub fn id(&self) -> NodeId {
@@ -334,6 +342,26 @@ impl Inner {
             .count()
     }
 
+    /// Pushes the records we hold back out to the `k` closest nodes, so they
+    /// survive nodes leaving and new nodes joining closer to the key. Also
+    /// clears out anything that has expired.
+    pub(crate) async fn republish(self: &Arc<Self>) {
+        let due = {
+            let mut store = self.store.lock().unwrap();
+            let now = Instant::now();
+            let expired = store.remove_expired(now);
+            if expired > 0 {
+                tracing::debug!(expired, "dropped expired records");
+            }
+            store.take_due_for_republish(now, self.config.republish_interval)
+        };
+
+        for (key, value, ttl) in due {
+            let replicas = self.replicate(key, value, ttl).await;
+            tracing::trace!(?key, replicas, "republished record");
+        }
+    }
+
     /// Runs a lookup for a random id in every bucket that hasn't seen one in
     /// `max_age`.
     pub(crate) async fn refresh_buckets(self: &Arc<Self>, max_age: Duration) {
@@ -352,6 +380,25 @@ impl Inner {
         nodes.truncate(k);
         nodes
     }
+}
+
+/// Runs `job` every `period`, starting one period from now.
+fn spawn_periodic<F, Fut>(inner: &Arc<Inner>, period: Duration, job: F) -> JoinHandle<()>
+where
+    F: Fn(Arc<Inner>) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let inner = Arc::clone(inner);
+    tokio::spawn(async move {
+        let mut ticks = time::interval_at(time::Instant::now() + period, period);
+        // If a job overruns, wait a full period before the next run rather
+        // than firing several back to back to catch up.
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            job(Arc::clone(&inner)).await;
+        }
+    })
 }
 
 async fn receive_loop(inner: Arc<Inner>) {

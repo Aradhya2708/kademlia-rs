@@ -9,6 +9,8 @@ use crate::id::NodeId;
 pub(crate) struct Record {
     pub value: Vec<u8>,
     pub expires_at: Instant,
+    /// When this record was last stored here or republished from here.
+    refreshed_at: Instant,
 }
 
 impl Record {
@@ -52,7 +54,14 @@ impl RecordStore {
         let expires_at = now
             .checked_add(ttl)
             .expect("ttl should be clamped before it reaches the store");
-        self.records.insert(key, Record { value, expires_at });
+        self.records.insert(
+            key,
+            Record {
+                value,
+                expires_at,
+                refreshed_at: now,
+            },
+        );
         true
     }
 
@@ -65,6 +74,30 @@ impl RecordStore {
         let before = self.records.len();
         self.records.retain(|_, r| r.expires_at > now);
         before - self.records.len()
+    }
+
+    /// Records that are due to be pushed back out to the network, as
+    /// `(key, value, remaining ttl)`. They're marked as refreshed on the way
+    /// out.
+    ///
+    /// A record is due once nobody has stored it here, and we haven't
+    /// republished it, for a whole `interval`. That's the optimisation from
+    /// section 2.5 of the paper: if another node just republished a record to
+    /// us, the other k-1 nodes holding it almost certainly got it too, so
+    /// there's no point in us doing the same thing an hour later.
+    pub fn take_due_for_republish(
+        &mut self,
+        now: Instant,
+        interval: Duration,
+    ) -> Vec<(NodeId, Vec<u8>, Duration)> {
+        self.records
+            .iter_mut()
+            .filter(|(_, r)| r.expires_at > now && now.duration_since(r.refreshed_at) >= interval)
+            .map(|(key, r)| {
+                r.refreshed_at = now;
+                (*key, r.value.clone(), r.ttl(now))
+            })
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -125,6 +158,51 @@ mod tests {
         assert!(store.put(b, vec![2], HOUR, now));
         assert!(!store.put(c, vec![3], HOUR, now));
         assert!(store.put(a, vec![4], HOUR, now));
+    }
+
+    #[test]
+    fn republish_waits_a_full_interval() {
+        let mut store = RecordStore::new(10);
+        let now = Instant::now();
+        let key = NodeId::hash(b"key");
+        store.put(key, b"value".to_vec(), 24 * HOUR, now);
+
+        assert!(
+            store
+                .take_due_for_republish(now + HOUR / 2, HOUR)
+                .is_empty()
+        );
+
+        let due = store.take_due_for_republish(now + HOUR, HOUR);
+        assert_eq!(due, vec![(key, b"value".to_vec(), 23 * HOUR)]);
+
+        // Taken once, not due again until another interval has passed.
+        assert!(store.take_due_for_republish(now + HOUR, HOUR).is_empty());
+        assert_eq!(store.take_due_for_republish(now + 2 * HOUR, HOUR).len(), 1);
+    }
+
+    #[test]
+    fn incoming_store_pushes_back_republish() {
+        let mut store = RecordStore::new(10);
+        let now = Instant::now();
+        let key = NodeId::hash(b"key");
+        store.put(key, b"value".to_vec(), 24 * HOUR, now);
+        // Someone else republished it to us half an hour later.
+        store.put(key, b"value".to_vec(), 24 * HOUR, now + HOUR / 2);
+
+        assert!(store.take_due_for_republish(now + HOUR, HOUR).is_empty());
+    }
+
+    #[test]
+    fn expired_records_are_never_republished() {
+        let mut store = RecordStore::new(10);
+        let now = Instant::now();
+        store.put(NodeId::hash(b"key"), vec![1], HOUR, now);
+        assert!(
+            store
+                .take_due_for_republish(now + 2 * HOUR, HOUR)
+                .is_empty()
+        );
     }
 
     #[test]
