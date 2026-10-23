@@ -8,6 +8,7 @@ mod lookup;
 mod node;
 pub mod protocol;
 pub mod routing;
+mod store;
 mod transport;
 
 pub use config::Config;

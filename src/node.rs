@@ -3,7 +3,7 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::ToSocketAddrs;
 use tokio::task::JoinHandle;
@@ -13,8 +13,9 @@ use crate::contact::Contact;
 use crate::error::{Error, Result};
 use crate::id::NodeId;
 use crate::lookup;
-use crate::protocol::{Body, MAX_DATAGRAM_LEN, Message, Request, Response};
+use crate::protocol::{Body, MAX_DATAGRAM_LEN, MAX_VALUE_LEN, Message, Request, Response};
 use crate::routing::{RoutingTable, UpdateOutcome};
+use crate::store::RecordStore;
 use crate::transport::{Reply, Transport};
 
 /// A running Kademlia node.
@@ -33,6 +34,7 @@ pub(crate) struct Inner {
     pub config: Config,
     pub transport: Transport,
     pub table: Mutex<RoutingTable>,
+    pub store: Mutex<RecordStore>,
     /// Contacts we're currently pinging to decide whether to evict them.
     liveness_checks: Mutex<HashSet<NodeId>>,
 }
@@ -53,6 +55,7 @@ impl Node {
         let inner = Arc::new(Inner {
             id,
             table: Mutex::new(RoutingTable::new(id, config.k)),
+            store: Mutex::new(RecordStore::new(config.max_records)),
             transport,
             config,
             liveness_checks: Mutex::new(HashSet::new()),
@@ -71,6 +74,11 @@ impl Node {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.transport.local_addr()
+    }
+
+    /// How many records this node is holding for the network.
+    pub fn record_count(&self) -> usize {
+        self.inner.store.lock().unwrap().len()
     }
 
     /// A snapshot of every contact in the routing table.
@@ -156,12 +164,35 @@ impl Inner {
     }
 
     fn handle_request(&self, requester: &NodeId, request: Request) -> Response {
+        let now = Instant::now();
         match request {
             Request::Ping => Response::Pong,
-            Request::FindNode { target } | Request::FindValue { key: target } => {
-                Response::Nodes(self.closest_for(requester, &target))
+            Request::FindNode { target } => Response::Nodes(self.closest_for(requester, &target)),
+            Request::FindValue { key } => {
+                let hit = self
+                    .store
+                    .lock()
+                    .unwrap()
+                    .get(&key, now)
+                    .map(|r| Response::Value {
+                        value: r.value.clone(),
+                        ttl: r.ttl(now),
+                    });
+                hit.unwrap_or_else(|| Response::Nodes(self.closest_for(requester, &key)))
             }
-            Request::Store { .. } => Response::Rejected,
+            Request::Store { key, value, ttl } => {
+                if value.len() > MAX_VALUE_LEN {
+                    return Response::Rejected;
+                }
+                // Don't let peers make us hold things longer than we would
+                // on our own.
+                let ttl = ttl.min(self.config.record_ttl);
+                if self.store.lock().unwrap().put(key, value, ttl, now) {
+                    Response::Stored
+                } else {
+                    Response::Rejected
+                }
+            }
         }
     }
 
@@ -359,5 +390,98 @@ mod tests {
         // a's ping to b times out, so c gets promoted from the replacement cache.
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(a.peers(), vec![Contact::new(c.id(), c.local_addr())]);
+    }
+
+    #[tokio::test]
+    async fn stored_value_is_served_by_find_value() {
+        let a = local_node().await;
+        let b = local_node().await;
+        let b_contact = Contact::new(b.id(), b.local_addr());
+        let key = NodeId::hash(b"greeting");
+
+        let store = Request::Store {
+            key,
+            value: b"hello".to_vec(),
+            ttl: Duration::from_secs(60),
+        };
+        assert_eq!(
+            a.inner.rpc(&b_contact, store).await.unwrap(),
+            Response::Stored
+        );
+        assert_eq!(b.record_count(), 1);
+
+        let found = a.inner.rpc(&b_contact, Request::FindValue { key }).await;
+        match found.unwrap() {
+            Response::Value { value, ttl } => {
+                assert_eq!(value, b"hello");
+                assert!(ttl <= Duration::from_secs(60));
+            }
+            other => panic!("expected a value, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn find_value_miss_returns_nodes() {
+        let a = local_node().await;
+        let b = local_node().await;
+        let b_contact = Contact::new(b.id(), b.local_addr());
+
+        let key = NodeId::hash(b"nobody has this");
+        let found = a.inner.rpc(&b_contact, Request::FindValue { key }).await;
+        assert!(matches!(found.unwrap(), Response::Nodes(_)));
+    }
+
+    #[tokio::test]
+    async fn store_clamps_ttl_to_our_own_limit() {
+        let config = Config {
+            record_ttl: Duration::from_secs(10),
+            ..test_config()
+        };
+        let a = local_node().await;
+        let b = Node::bind("127.0.0.1:0", config).await.unwrap();
+        let b_contact = Contact::new(b.id(), b.local_addr());
+        let key = NodeId::hash(b"key");
+
+        let store = Request::Store {
+            key,
+            value: vec![1],
+            ttl: Duration::MAX,
+        };
+        a.inner.rpc(&b_contact, store).await.unwrap();
+
+        let ttl = b
+            .inner
+            .store
+            .lock()
+            .unwrap()
+            .get(&key, Instant::now())
+            .unwrap()
+            .ttl(Instant::now());
+        assert!(ttl <= Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn store_rejects_when_full() {
+        let config = Config {
+            max_records: 1,
+            ..test_config()
+        };
+        let a = local_node().await;
+        let b = Node::bind("127.0.0.1:0", config).await.unwrap();
+        let b_contact = Contact::new(b.id(), b.local_addr());
+
+        let store = |key: &[u8]| Request::Store {
+            key: NodeId::hash(key),
+            value: vec![1],
+            ttl: Duration::from_secs(60),
+        };
+        assert_eq!(
+            a.inner.rpc(&b_contact, store(b"one")).await.unwrap(),
+            Response::Stored
+        );
+        assert_eq!(
+            a.inner.rpc(&b_contact, store(b"two")).await.unwrap(),
+            Response::Rejected
+        );
     }
 }
